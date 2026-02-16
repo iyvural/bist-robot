@@ -1,33 +1,39 @@
-print("🚀 PROGRAM BAŞLADI")
-
 import os
+import hashlib
+from datetime import datetime
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
-from datetime import datetime
+
+print("PROGRAM BASLADI")  # emoji koymak istersen cloud'da sorun olmaz, windows log'da bozulabiliyor
 
 # ========================
-# TELEGRAM (DİREKT KODA YAZ)
+# TELEGRAM (ENV ÖNCELİKLİ)
+# Render'da Environment Variables:
+#   TG_TOKEN=...
+#   TG_CHAT_ID=1110011334
 # ========================
-TG_TOKEN = "8262289617:AAEGjJR3wlWScEOAgzaFuSk7-FYobiqQKlw"   # <-- kendi bilgisayarında yapıştır
-TG_CHAT_ID = "1110011334"              # <-- sende bu doğruysa kalsın
+TG_TOKEN = os.getenv("TG_TOKEN", "").strip()
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "").strip()
+
+# (İstersen lokal için fallback bırakabilirsin ama cloud'da ENV kullanmak en doğru)
+# TG_TOKEN = TG_TOKEN or "BURAYA_TOKEN_YAZMA"   # tavsiye etmiyorum
+# TG_CHAT_ID = TG_CHAT_ID or "1110011334"
 
 def telegram_gonder(mesaj: str):
     """Telegram'a mesaj gönderir. Hata varsa terminalde gösterir."""
-    if not TG_TOKEN or TG_TOKEN.startswith("BURAYA_") or not TG_CHAT_ID:
-        print("⚠️ Telegram ayarlı değil: TG_TOKEN / TG_CHAT_ID kontrol et.")
-        return
+    if not TG_TOKEN or not TG_CHAT_ID:
+        print("⚠️ Telegram ayarlı değil: TG_TOKEN / TG_CHAT_ID ENV kontrol et.")
+        return False
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-
-    # Telegram mesaj limiti 4096. Monospace bloklar ve açıklamalar uzayabilir -> parçalayalım
     chunks = [mesaj[i:i+3500] for i in range(0, len(mesaj), 3500)]
 
     for part in chunks:
         payload = {"chat_id": TG_CHAT_ID, "text": part}
-        r = requests.post(url, json=payload, timeout=15)
-
+        r = requests.post(url, json=payload, timeout=20)
         try:
             data = r.json()
         except Exception:
@@ -35,23 +41,38 @@ def telegram_gonder(mesaj: str):
 
         if r.status_code != 200 or not data.get("ok", False):
             print("❌ Telegram gönderim hatası:", data)
-            return
+            return False
 
     print("✅ Telegram OK")
+    return True
+
+# ========================
+# STATE (listener için)
+# ========================
+os.makedirs("state", exist_ok=True)
+
+def write_state(last_run_text: str, last_summary_text: str):
+    with open("state/last_run.txt", "w", encoding="utf-8") as f:
+        f.write(last_run_text)
+    with open("state/last_summary.txt", "w", encoding="utf-8") as f:
+        f.write(last_summary_text)
+
+def read_last_digest() -> str:
+    p = "state/last_digest.txt"
+    if os.path.exists(p):
+        with open(p, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return ""
+
+def write_last_digest(d: str):
+    with open("state/last_digest.txt", "w", encoding="utf-8") as f:
+        f.write(d)
 
 # ========================
 # OUTPUT
 # ========================
 os.makedirs("output", exist_ok=True)
 OUTPUT_PATH = "output/signals.xlsx"
-
-# Excel açık kalırsa yazamaz; uyarı ver
-if os.path.exists(OUTPUT_PATH):
-    try:
-        os.remove(OUTPUT_PATH)
-    except PermissionError:
-        print("⚠️ output/signals.xlsx açık görünüyor. Excel’i kapatıp tekrar çalıştır.")
-        raise
 
 # ========================
 # INDICATORS
@@ -91,24 +112,71 @@ tickers = load_tickers()
 results = []
 
 # ========================
+# TELEGRAM FORMAT HELPERS
+# ========================
+def icon_for(signal: str) -> str:
+    if signal.startswith("AL"):
+        return "🟢"
+    if signal == "SAT":
+        return "🔴"
+    return "🟡"
+
+def yorum_uret(r):
+    rsi_v = r.get("RSI")
+    macd_d = r.get("MACD_dir")
+
+    if rsi_v is None or macd_d in (None, "?"):
+        return f"{r['Hisse']} → Veri yetersiz, takip et."
+
+    if rsi_v >= 70:
+        rsi_txt = "RSI yüksek (aşırı alım)"
+    elif rsi_v <= 30:
+        rsi_txt = "RSI düşük (aşırı satım)"
+    else:
+        rsi_txt = "RSI normal aralık"
+
+    if macd_d == "↑":
+        macd_txt = "MACD yükseliyor (momentum artıyor)"
+    elif macd_d == "↓":
+        macd_txt = "MACD düşüyor (momentum zayıflıyor)"
+    else:
+        macd_txt = "MACD yatay (kararsız)"
+
+    if rsi_v >= 70 and macd_d == "↓":
+        extra = "→ Dikkat: düzeltme/kâr satışı ihtimali artar."
+    elif rsi_v <= 30 and macd_d == "↑":
+        extra = "→ Dikkat: tepki yükselişi / fırsat olabilir."
+    elif 40 <= rsi_v <= 60 and macd_d == "↑":
+        extra = "→ Trend güçleniyor, fırsat doğabilir."
+    elif 40 <= rsi_v <= 60 and macd_d == "↓":
+        extra = "→ Zayıflama var, temkinli ol."
+    else:
+        extra = "→ Net değil, takip et."
+
+    return f"{r['Hisse']} → {rsi_txt} + {macd_txt} {extra}"
+
+# ========================
 # MAIN LOOP
 # ========================
 for ticker in tickers:
-    print(f"📊 {ticker} analiz ediliyor...")
+    print(f"{ticker} analiz ediliyor...")
 
-    df = yf.download(
-        ticker,
-        period="6mo",
-        interval="1d",
-        auto_adjust=False,
-        progress=False
-    )
+    try:
+        df = yf.download(
+            ticker,
+            period="6mo",
+            interval="1d",
+            auto_adjust=False,
+            progress=False
+        )
+    except Exception as e:
+        print(f"⚠️ {ticker}: yfinance hata: {e}")
+        continue
 
     if df is None or df.empty or len(df) < 80:
         print(f"⚠️ {ticker}: veri yetersiz")
         continue
 
-    # MultiIndex fix
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
@@ -127,7 +195,6 @@ for ticker in tickers:
     ema50 = float(last["EMA50"]) if pd.notna(last["EMA50"]) else np.nan
     atr_val = float(last["ATR"]) if pd.notna(last["ATR"]) else 0.0
 
-    # MACD yön oku (momentum artıyor mu azalıyor mu?)
     if not np.isnan(macd_val) and not np.isnan(prev_macd):
         macd_dir = "↑" if macd_val > prev_macd else ("↓" if macd_val < prev_macd else "→")
     else:
@@ -135,28 +202,22 @@ for ticker in tickers:
 
     signal = "BEKLE"
 
-    # ========================
-    # STRATEJİ (GÜÇLÜ)
-    # ========================
+    # STRATEJİ
     if (not np.isnan(rsi_val)) and (not np.isnan(macd_val)) and (not np.isnan(prev_macd)) and (not np.isnan(ema50)):
-        # AL: Trend yukarı + RSI düşük/orta + MACD histogram toparlıyor
         if (price > ema50) and (rsi_val < 40) and (macd_val > prev_macd):
             signal = "AL (GÜÇLÜ)"
-        # SAT: RSI yüksek + MACD histogram düşmeye başlamış
         elif (rsi_val > 70) and (macd_val < prev_macd):
             signal = "SAT"
 
-    # ========================
-    # RİSK / HEDEF (OTOMATİK)
-    # ========================
+    # STOP / HEDEF
     if atr_val > 0:
         stop = price - (2 * atr_val)
-        target = price + (price - stop) * 2  # 2R hedef
+        target = price + (price - stop) * 2
     else:
         stop = price * 0.95
         target = price * 1.10
 
-    row = {
+    results.append({
         "Hisse": ticker,
         "Fiyat": round(price, 2),
         "RSI": round(rsi_val, 2) if not np.isnan(rsi_val) else None,
@@ -167,63 +228,20 @@ for ticker in tickers:
         "Sinyal": signal,
         "Stop": round(stop, 2),
         "Hedef": round(target, 2),
-    }
-
-    results.append(row)
+    })
 
 # ========================
-# SAVE EXCEL
+# SAVE EXCEL (izin hatasına dayanıklı)
 # ========================
 df_out = pd.DataFrame(results)
-df_out.to_excel(OUTPUT_PATH, index=False)
-print("✅ Excel oluşturuldu:", OUTPUT_PATH)
-
-# ========================
-# TELEGRAM FORMAT HELPERS
-# ========================
-def icon_for(signal: str) -> str:
-    if signal.startswith("AL"):
-        return "🟢"
-    if signal == "SAT":
-        return "🔴"
-    return "🟡"
-
-def yorum_uret(r):
-    rsi_v = r.get("RSI")
-    macd_d = r.get("MACD_dir")
-
-    if rsi_v is None or macd_d in (None, "?"):
-        return f"{r['Hisse']} → Veri yetersiz, takip et."
-
-    # RSI
-    if rsi_v >= 70:
-        rsi_txt = "RSI yüksek (aşırı alım)"
-    elif rsi_v <= 30:
-        rsi_txt = "RSI düşük (aşırı satım)"
-    else:
-        rsi_txt = "RSI normal aralık"
-
-    # MACD yön
-    if macd_d == "↑":
-        macd_txt = "MACD yükseliyor (momentum artıyor)"
-    elif macd_d == "↓":
-        macd_txt = "MACD düşüyor (momentum zayıflıyor)"
-    else:
-        macd_txt = "MACD yatay (kararsız)"
-
-    # Birleşik uyarı
-    if rsi_v >= 70 and macd_d == "↓":
-        extra = "→ Dikkat: düzeltme/kâr satışı ihtimali artar."
-    elif rsi_v <= 30 and macd_d == "↑":
-        extra = "→ Dikkat: tepki yükselişi / alım fırsatı olabilir."
-    elif 40 <= rsi_v <= 60 and macd_d == "↑":
-        extra = "→ Trend güçleniyor, fırsat doğabilir."
-    elif 40 <= rsi_v <= 60 and macd_d == "↓":
-        extra = "→ Zayıflama var, temkinli ol."
-    else:
-        extra = "→ Net değil, takip et."
-
-    return f"{r['Hisse']} → {rsi_txt} + {macd_txt} {extra}"
+try:
+    df_out.to_excel(OUTPUT_PATH, index=False)
+    print("✅ Excel oluşturuldu:", OUTPUT_PATH)
+except PermissionError:
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    alt_path = f"output/signals_{ts}.xlsx"
+    df_out.to_excel(alt_path, index=False)
+    print(f"⚠️ Excel kilitliydi. Alternatif yazıldı: {alt_path}")
 
 # ========================
 # TELEGRAM MESSAGE (Sinyal Verenler -> Takip Listesi -> Yorumlar)
@@ -231,16 +249,13 @@ def yorum_uret(r):
 sinyal_verenler = [r for r in results if r["Sinyal"] != "BEKLE"]
 tum_liste = results
 
-# Monospace hizalama için kod bloğu
 header = f"{'':<2} {'Hisse':<10} {'Sinyal':<12} {'Fiyat':>8} {'RSI':>6} {'MACD':>10} {'Stop':>9} {'Hedef':>9}"
 sep = "-" * 74
-
 now_txt = datetime.now().strftime("%d.%m.%Y %H:%M")
 
 parts = []
 parts.append(f"📌 BIST Takip Listesi ({now_txt})")
 
-# 1) Sinyal Verenler
 parts.append("")
 parts.append("🚨 Sinyal Verenler")
 parts.append("```")
@@ -259,7 +274,6 @@ else:
     parts.append("🟡  Yok (bugün AL/SAT sinyali yok)")
 parts.append("```")
 
-# 2) Takip Listesi
 parts.append("")
 parts.append("📋 Takip Listesi")
 parts.append("```")
@@ -275,16 +289,29 @@ for r in tum_liste:
     )
 parts.append("```")
 
-# 3) Yorumlar
 parts.append("")
 parts.append("🧠 Yorumlar (RSI + MACD)")
-# Önce sinyal verenler, yoksa ilk 5
 yorum_kaynak = sinyal_verenler if sinyal_verenler else tum_liste[:5]
 for r in yorum_kaynak:
     parts.append("• " + yorum_uret(r))
 
 mesaj = "\n".join(parts)
-telegram_gonder(mesaj)
-print("📲 Telegram: özet gönderildi.")
 
-print("🏁 PROGRAM BİTTİ")
+# ========================
+# STATE + SPAM ENGELİ + TELEGRAM
+# ========================
+last_run_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+write_state(last_run_text, mesaj)
+
+digest = hashlib.md5(mesaj.encode("utf-8")).hexdigest()
+last_digest = read_last_digest()
+
+if digest == last_digest:
+    print("ℹ️ Değişiklik yok, Telegram gönderilmedi.")
+else:
+    ok = telegram_gonder(mesaj)
+    if ok:
+        write_last_digest(digest)
+        print("📲 Telegram: yeni özet gönderildi.")
+
+print("PROGRAM BITTI")
